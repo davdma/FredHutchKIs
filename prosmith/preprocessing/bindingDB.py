@@ -47,18 +47,6 @@ def get_bindingdb_parser(**kwargs):
         choices=[1280, 2560, 5120],
         help=f"ESM model embedding dim: 1280, 2560, 5120 (default: 1280)."
     )
-    parser.add_argument(
-        "--prot_emb_no",
-        default=2000, # can increase as we have lots of RAM - since we have <2000 proteins and smiles we should be ok
-        type=int,
-        help="Number of protein sequences in one dictionary.", # this determines subsets read in by dataloader
-    )
-    parser.add_argument(
-        "--smiles_emb_no",
-        default=2000,
-        type=int,
-        help="Number of SMILES strings in one dictionary.",
-    )
     return parser
 
 if __name__ == "__main__":
@@ -83,6 +71,6 @@ if __name__ == "__main__":
     
     # embeddings contains all proteins and smiles across train / val / test split 
     print("Calculating protein embeddings:")
-    calculate_protein_embeddings(all_sequences, str(embed_path), args.prot_emb_no, esm_version=args.esm_version, embedding_size=args.embedding_size, toks_per_batch=args.toks_per_batch, use_gpu=args.use_gpu)
+    calculate_protein_embeddings_fast(all_sequences, str(embed_path), esm_version=args.esm_version, embedding_size=args.embedding_size, toks_per_batch=4096, use_gpu=args.use_gpu)
     print("Calculating SMILES embeddings:")
-    calculate_smiles_embeddings(all_smiles, str(embed_path), args.smiles_emb_no)
+    calculate_smiles_embeddings_fast(all_smiles, str(embed_path))

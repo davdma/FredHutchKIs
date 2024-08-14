@@ -12,9 +12,50 @@ from itertools import accumulate
 import random
 from time import time
 from prosmith.utils.train_utils import *
+import numpy as np
 
 # Disable future warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+class SMILESProteinFastDataset(Dataset):
+    """More efficient rewrite of the previous SMILES Protein dataset object that keeps all files in CPU memory
+    and only loads batches to the GPU when needed."""
+    def __init__(self, data_path, embed_dir):
+        # load in the SMILES and protein embeddings dictionaries and CSVs during initialization
+        self.max_prot_seq_len = 1018
+        self.max_smiles_seq_len = 256
+        self.df = pd.read_csv(data_path).drop(columns=['Compound', 'order', 'kinase'])
+        self.prot_embed_dict = torch.load(embed_dir / 'all_protein_embeddings.pt')
+        with open(embed_dir / 'all_smiles_embeddings.pkl', 'rb') as f:
+            self.smiles_embed_dict = pkl.load(f)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        label = float(row['output'])
+        protein = row['Protein sequence']
+        smiles = row['SMILES']
+        index = int(self.df.index[idx])
+
+        smiles_emb = self.smiles_embed_dict[smiles].squeeze()
+        protein_emb = torch.from_numpy(self.prot_embed_dict[protein[:1018]])
+        smiles_attn_mask = torch.zeros(self.max_smiles_seq_len)
+        smiles_attn_mask[:smiles_emb.shape[0]] = 1
+        protein_attn_mask = torch.zeros(self.max_prot_seq_len)
+        protein_attn_mask[:protein_emb.shape[0]] = 1
+        smiles_padding = (0, 0, 0, self.max_smiles_seq_len - smiles_emb.shape[0])
+        prot_padding = (0, 0, 0, self.max_prot_seq_len - protein_emb.shape[0])
+
+        smiles_emb = torch.nn.functional.pad(smiles_emb, smiles_padding, mode='constant', value=0)
+        protein_emb = torch.nn.functional.pad(protein_emb, prot_padding, mode='constant', value=0)
+
+        labels = torch.tensor([label], dtype=torch.float32)
+        labels.requires_grad = False
+        smiles_emb = smiles_emb.detach()
+        protein_emb = protein_emb.detach()
+        return smiles_emb, smiles_attn_mask, protein_emb, protein_attn_mask, labels, index
 
 class SMILESProteinDataset(Dataset):
     def __init__(self,  

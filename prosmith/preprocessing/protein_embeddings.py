@@ -8,6 +8,64 @@ from esm import Alphabet, FastaBatchedDataset, ProteinBertModel, pretrained
 from prosmith.utils.kinase_utils import create_empty_path
 from Bio import SeqIO
 
+def calculate_protein_embeddings_fast(all_sequences, outpath, esm_version = '2', embedding_size=1280, toks_per_batch=4096, use_gpu=True):
+    """For efficient data loading write all embeddings to one file."""
+    assert embedding_size in [1280, 2560, 5120]
+    fasta_file = join(outpath, "all_sequences.fasta")
+    create_fasta_file(all_sequences, fasta_file)
+
+    # Swapping to ESM2 - same embedding size of 1280
+    if esm_version == '1b':
+        if embedding_size == 1280:
+            esm_model = "esm1b_t33_650M_UR50S"
+            num_repr_layers = 33
+        else:
+            raise Exception('Embedding size outside of 1280 not supported for ESM 1b.')
+    else:
+        if embedding_size == 1280:
+            esm_model = 'esm2_t33_650M_UR50D'
+            num_repr_layers = 33
+        elif embedding_size == 2560:
+            esm_model = 'esm2_t36_3B_UR50D'
+            num_repr_layers = 36
+        else:
+            esm_model = 'esm2_t48_15B_UR50D'
+            num_repr_layers = 48
+
+    print('Using ESM:', esm_model)
+    model, alphabet = pretrained.load_model_and_alphabet(esm_model) # prev: "esm1b_t33_650M_UR50S"
+    model.eval()
+    if torch.cuda.is_available() and use_gpu:
+        device = "cuda"
+        model = model.to(device)
+        print("Transferred model to GPU")
+
+    dataset = FastaBatchedDataset.from_file(fasta_file)
+    batches = dataset.get_batch_indices(toks_per_batch, extra_toks_per_seq=1)
+    data_loader = torch.utils.data.DataLoader(dataset, collate_fn=alphabet.get_batch_converter(), batch_sampler=batches)
+
+    prot_embed_dict = {}
+    with torch.no_grad():
+        for batch_idx, (labels, strs, toks) in enumerate(data_loader):
+            print(
+                f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)"
+            )
+            if torch.cuda.is_available() and use_gpu:
+                toks = toks.to(device, non_blocking=True)
+
+            # The model is trained on truncated sequences and passing longer ones in at
+            # infernce will cause an error. See https://github.com/facebookresearch/esm/issues/21
+            toks = toks[:, :1022]
+
+            out = model(toks, repr_layers=[num_repr_layers], return_contacts=False)
+            # get embedding representation
+            representation = out["representations"][num_repr_layers].to(device="cpu")
+            for i, seq in enumerate(strs):
+                prot_embed_dict[seq] = representation[i, 1:len(seq) + 1].clone().numpy()
+
+    # save final dictionary
+    torch.save(prot_embed_dict, join(outpath, "all_protein_embeddings.pt"))
+
 def calculate_protein_embeddings(all_sequences, outpath, prot_emb_no = 1000, esm_version = '2', embedding_size=1280, toks_per_batch=4096, use_gpu=True):
     assert embedding_size in [1280, 2560, 5120]
     create_empty_path(join(outpath, "Protein"))
@@ -18,15 +76,19 @@ def calculate_protein_embeddings(all_sequences, outpath, prot_emb_no = 1000, esm
     if esm_version == '1b':
         if embedding_size == 1280:
             esm_model = "esm1b_t33_650M_UR50S"
+            num_repr_layers = 33
         else:
             raise Exception('Embedding size outside of 1280 not supported for ESM 1b.')
     else:
         if embedding_size == 1280:
             esm_model = 'esm2_t33_650M_UR50D'
+            num_repr_layers = 33
         elif embedding_size == 2560:
             esm_model = 'esm2_t36_3B_UR50D'
+            num_repr_layers = 36
         else:
             esm_model = 'esm2_t48_15B_UR50D'
+            num_repr_layers = 48
             
     print('Using ESM:', esm_model)
     model, alphabet = pretrained.load_model_and_alphabet(esm_model) # prev: "esm1b_t33_650M_UR50S"
@@ -54,17 +116,15 @@ def calculate_protein_embeddings(all_sequences, outpath, prot_emb_no = 1000, esm
             # infernce will cause an error. See https://github.com/facebookresearch/esm/issues/21
             toks = toks[:, :1022]
 
-            out = model(toks, repr_layers=[33], return_contacts=False)
+            out = model(toks, repr_layers=[num_repr_layers], return_contacts=False)
 
             logits = out["logits"].to(device="cpu")
             representations = {
                 layer: t.to(device="cpu") for layer, t in out["representations"].items()
             }
             
-
             for i, label in enumerate(labels):
                 output_file = join(output_dir, label + ".pt")
-                
                 
                 result = {"label": label}
                 result["representations"] = {
@@ -73,10 +133,9 @@ def calculate_protein_embeddings(all_sequences, outpath, prot_emb_no = 1000, esm
                 }
                 
                 torch.save(result, output_file)
-    merge_protein_emb_files(output_dir, outpath, fasta_file, prot_emb_no)
+    merge_protein_emb_files(output_dir, outpath, fasta_file, prot_emb_no, num_repr_layers)
 
-
-def merge_protein_emb_files(output_dir, outpath, fasta_file, prot_emb_no):
+def merge_protein_emb_files(output_dir, outpath, fasta_file, prot_emb_no, num_repr_layers):
     new_dict = {}
 
     version = 0
@@ -91,12 +150,11 @@ def merge_protein_emb_files(output_dir, outpath, fasta_file, prot_emb_no):
 
         name, sequence = fasta.id, str(fasta.seq)
         rep_dict = torch.load(join(output_dir, name +".pt"))
-        new_dict[sequence] = rep_dict["representations"][33].numpy()
+        new_dict[sequence] = rep_dict["representations"][num_repr_layers].numpy()
 
     torch.save(new_dict, join(outpath, "Protein", "Protein_embeddings_V"+str(version)+".pt"))
 
     shutil.rmtree(output_dir)
-
 
 def create_fasta_file(sequences, filename):
     ofile = open(filename, "w")

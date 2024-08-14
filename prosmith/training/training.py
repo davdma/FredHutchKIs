@@ -12,7 +12,7 @@ from prosmith.utils.modules import (
     MM_TN,
     MM_TNConfig,
 )
-from prosmith.utils.data_utils import SMILESProteinDataset
+from prosmith.utils.data_utils import SMILESProteinFastDataset
 from prosmith.utils.train_utils import *
 from prosmith.utils.gen_utils import save_config
 
@@ -126,9 +126,12 @@ def train(args, model, trainloader, optimizer, criterion, device, gpu, epoch, lo
     logger.info(f"Training for epoch {epoch+1}")
     for step, batch in enumerate(trainloader):
         # logging.info(f"Batch: {step}, Time ={np.round(time.time()-start_time)}")
-        if is_cuda(device):
-                batch = [r.cuda(gpu) for r in batch]
         smiles_emb, smiles_attn, protein_emb, protein_attn, labels, _ = batch
+        smiles_emb = smiles_emb.to(device)
+        smiles_attn = smiles_attn.to(device)
+        protein_emb = protein_emb.to(device)
+        protein_attn = protein_attn.to(device)
+        labels = labels.to(device)
         
         # zero the gradients
         optimizer.zero_grad()
@@ -166,9 +169,12 @@ def evaluate(args, model, valloader, criterion, device, gpu, logger):
     with torch.no_grad():
         for step, batch in enumerate(valloader):
             # move batch to device
-            if is_cuda(device):
-                batch = [r.cuda(gpu) for r in batch]
             smiles_emb, smiles_attn, protein_emb, protein_attn, labels, _ = batch
+            smiles_emb = smiles_emb.to(device)
+            smiles_attn = smiles_attn.to(device)
+            protein_emb = protein_emb.to(device)
+            protein_attn = protein_attn.to(device)
+            labels = labels.to(device)
             
             # forward pass
             outputs = model(
@@ -258,6 +264,7 @@ def trainer(gpu, args, device):
         torch.manual_seed(0)
         torch.cuda.set_device(gpu)
 
+    is_distributed = args.world_size > 1
     # set up logging
     log_file = args.save_path / ("log_" + args.log_name + '_' + str(dist.get_rank()) + '_' + str(args.world_size) + '.log')
     logger = logging.getLogger('process_log')
@@ -361,58 +368,49 @@ def trainer(gpu, args, device):
         flag_tensor = torch.zeros(1).to(device)
     else:
         best_val_loss = float('inf')
-        
+
+    # create the dataloader
+    logger.info(f"Loading dataset to {device}:{gpu}")
+    train_dataset = SMILESProteinFastDataset(data_path=args.save_path / 'train.csv',
+                                             embed_dir=args.save_path / 'embeddings')
+    val_dataset = SMILESProteinFastDataset(data_path=args.save_path / 'val.csv',
+                                       embed_dir=args.save_path / 'embeddings')
+    if is_distributed:
+        # distributed training
+        logger.info(f"Distributed training...")
+        trainsampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=args.world_size, rank=gpu, drop_last=True)
+        valsampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=args.world_size, rank=gpu, drop_last=True)
+    else: 
+        trainsampler = None
+        valsampler = None
+
+    logger.info(f"Loading dataloader")
+    trainloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(trainsampler is None), num_workers=1, sampler=trainsampler, pin_memory=True)
+    valloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=(valsampler is None), num_workers=1, sampler=valsampler, pin_memory=True)
+    
     for epoch in range(args.num_train_epochs):
-        logger.info(f"Loading dataset to {device}:{gpu}")
-        train_dataset = SMILESProteinDataset(
-            data_path=args.save_path / 'train.csv',
-            embed_dir=args.save_path / 'embeddings',
-            train=True,
-            device=device, 
-            gpu=gpu,
-            random_state=int(epoch),
-            task=args.task,
-            extraction_mode = False) 
-
-        val_dataset = SMILESProteinDataset(
-            data_path=args.save_path / 'val.csv',
-            embed_dir=args.save_path / 'embeddings',
-            train=False, 
-            device=device, 
-            gpu=gpu,
-            random_state=int(epoch),
-            task=args.task,
-            extraction_mode = False)
-
-        trainsampler = DistributedSampler(train_dataset, shuffle=False, num_replicas=args.world_size, rank=gpu, drop_last=True)
-        valsampler = DistributedSampler(val_dataset, shuffle=False, num_replicas=args.world_size, rank=gpu, drop_last=True)
-
-        logger.info(f"Loading dataloader")
-        trainloader = DataLoader(train_dataset, batch_size=args.batch_size, 
-                                 shuffle=False, num_workers=1, sampler=trainsampler)
-        valloader = DataLoader(val_dataset, batch_size=args.batch_size, 
-                               shuffle=False, num_workers=1, sampler=valsampler)
-
         start_time = time.time()
         logger.info(f"Training started for epoch: {epoch+1}")
+        if is_distributed:
+            trainsampler.set_epoch(epoch)
+            valsampler.set_epoch(epoch)
+            
         train_loss = train(args, model, trainloader, optimizer, criterion, device, gpu, epoch, logger)
-        logger.info(f"Training complete")
+        train_end_time = time.time()
+        logger.info(f"Training loop complete: finished in {train_end_time - start_time} seconds.")
 
         # wandb logging
         if is_main_process():
             wandb.log({"train loss": train_loss})
 
-        del trainsampler
-        del trainloader
-        del train_dataset
-
-        logger.info(f"Val performance:")
+        logger.info(f"Evaluating...")
+        eval_start_time = time.time()
         # val loss is reported loss, val_metrics should be dictionary containing additional evaluation metrics
         val_loss, val_metrics = evaluate(args, model, valloader, criterion, device, gpu, logger)
-        logger.info(f"Evaluation complete")
+        eval_end_time = time.time()
+        logger.info(f"Evaluation complete: finished in {eval_end_time - eval_start_time} seconds.")
         logger.info('-' * 80)
-        logger.info(f'| Device id: {gpu} | End of epoch: {(epoch+1)} | '
-                     f'Time taken: {(time.time()-start_time):5.2f}s |\n| Train Loss {train_loss:2.5f} | Val Loss: {val_loss:2.5f} |')
+        logger.info(f'| Device id: {gpu} | End of epoch: {(epoch+1)} | Train Loss {train_loss} | Val Loss: {val_loss}')
 
         val_log = {"val loss": val_loss}
         for metric, metric_value in val_metrics.items():
@@ -444,9 +442,12 @@ def trainer(gpu, args, device):
                 best_val_loss = val_loss
                 if is_main_process():
                     torch.save(model.state_dict(), os.path.join(str(args.save_model_path / 'model'), 'model_chkpt.pkl'))
-
+                    
+        end_time = time.time()
+        logger.info(f'Epoch total time: {end_time - start_time}s')
+        
     # log best metrics on wandb
-    logger.info('Training complete.')
+    logger.info('All training complete.')
     if is_main_process():
         if args.early_stopping:
             for metric, metric_value in early_stopper.get_metric().items():
