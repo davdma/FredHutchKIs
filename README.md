@@ -1,4 +1,6 @@
 # FredHutchKIs
+![image](https://github.com/user-attachments/assets/8f0c4a10-49ca-4518-8ad1-b1c31d7e0793)
+
 ### Description: 
 Using ProSmith<sup>10</sup> multimodal transformer networks for modeling kinase inhibitor-kinase small molecule to protein interaction and inhibition.
 
